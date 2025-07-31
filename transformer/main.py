@@ -5,7 +5,6 @@
 @time: 2025/7/31 9:31
 @desc: 
 """
-from tokenizers.decoders import Decoder
 from torch import nn
 
 from transformer.encoder import Encoder
@@ -15,11 +14,12 @@ class Transformer(nn.Module):
     def __init__(self):
         super(Transformer, self).__init__()
         #
-        self.encoder = Encoder()
+        self.encoder = nn.Sequential(
+            Encoder(),
+        )
         self.decoder = Decoder()
 
-    def forward(self, x):
-        # 位置编码
+    def forward(self, x): # x [batch_size, seq_len, hidden_size]
 
         # 编码器
         x = self.encoder(x)
