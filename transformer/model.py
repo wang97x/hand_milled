@@ -10,10 +10,18 @@ import torch
 from torch import nn
 
 class PositionalEncoding(nn.Module):
-    def __init__(self, d_model, max_len=5000):
-        pass
+    def __init__(self, d_model, max_len=512):
+        super().__init__()
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
+
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+
+        self.register_buffer('pe', pe.unsqueeze(0))
     def forward(self, x):
-        pass
+        return x+self.pe[:, :x.size(1)].to(x.device)
 
 class LayerNorm(nn.Module):
     def __init__(self, d_model, eps=1e-6):
@@ -22,7 +30,11 @@ class LayerNorm(nn.Module):
         self.a_2 = nn.Parameter(torch.ones(d_model))
         self.b_2 = nn.Parameter(torch.zeros(d_model))
     def forward(self, x):
-        pass
+        mean = x.mean(-1, keepdim=True)
+        var = x.var(-1, unbiased=False, keepdim=True)
+
+        x = (x - mean) / (torch.sqrt(var + self.eps))
+        return self.a_2 * x + self.b_2
 
 class MultiHeadAttention(nn.Module):
     def __init__(self, hidden_size, num_heads):
@@ -48,7 +60,7 @@ class MultiHeadAttention(nn.Module):
         k = k.view(bsz, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
         v = v.view(bsz, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
 
-        k = k.transpose_(2, 3)
+        k = k.transpose(2, 3)
         q_k = torch.matmul(q, k)/self.scale
         if mask is not None:
             mask = mask.unsqueeze(1).expand_as(q_k)
@@ -63,7 +75,8 @@ class EncoderLayer(nn.Module):
         super().__init__()
 
         self.self_attn = MultiHeadAttention(hidden_size, n_head)
-        self.layer_norm = LayerNorm(hidden_size)
+        self.layer_norm1 = LayerNorm(hidden_size)
+        self.layer_norm2 = LayerNorm(hidden_size)
         self.feed_forward = nn.Sequential(
             nn.Linear(hidden_size, ffn_size),
             nn.ReLU(),
@@ -73,35 +86,36 @@ class EncoderLayer(nn.Module):
 
     def forward(self,x, mask=None):
         h = self.self_attn(x, mask=mask)
-        h = x + self.layer_norm(h)
+        h = self.layer_norm1(x + h)
         ffn_h = self.feed_forward(h)
-        return h + self.layer_norm(ffn_h)
+        out = self.layer_norm2(h + ffn_h)
+        return out
 
 class TokenEmbedding(nn.Module):
-    def __init__(self, vocab_size, embed_size, dropout):
+    def __init__(self, vocab_size, embed_size):
         super().__init__()
         self.embedding = nn.Embedding(vocab_size, embed_size)
         self.positional_encoding = PositionalEncoding(embed_size)
-        self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
         x = self.embedding(x)
-        x = self.dropout(x)
-        return x+self.positional_encoding(x)
+        x = self.positional_encoding(x)
+        return x
 
 class Encoder(nn.Module):
     def __init__(self, hidden_size, n_head, max_len, voc_size, ffn_size, dropout, n_layers, device):
         super().__init__()
 
-        self.token_embeddings = TokenEmbedding(vocab_size=voc_size, embed_size=hidden_size, dropout=dropout)
+        self.token_embeddings = TokenEmbedding(vocab_size=voc_size, embed_size=hidden_size)
 
-        self.encoder_layer = nn.ModuleList(
+        self.encoder_layers = nn.ModuleList(
             [EncoderLayer(hidden_size, n_head, ffn_size, dropout) for _ in range(n_layers)]
         )
 
-    def forward(self,x):
+    def forward(self,x, mask=None):
         h = self.token_embeddings(x)
-        h = self.encoder_layer(h)
+        for layer in self.encoder_layers:
+            h = layer(h, mask)
         return h
 
 class Transformer(nn.Module):
@@ -128,7 +142,9 @@ class Transformer(nn.Module):
         # return trg_out
 
     def src_padding_mask(self, src):
-        return None
+        return (src==self.src_pad_idx)
 
     def trg_causal_mask(self, trg):
-        return None
+        seq_len = trg.size(-1)
+        mask = torch.triu(torch.ones(seq_len, seq_len), diagonal=1)
+        return mask
