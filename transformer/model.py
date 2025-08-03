@@ -118,6 +118,47 @@ class Encoder(nn.Module):
             h = layer(h, mask)
         return h
 
+class DecoderLayer(nn.Module):
+    def __init__(self, hidden_size, n_head, ffn_size, dropout):
+        super().__init__()
+        self.self_attn = MultiHeadAttention(hidden_size, n_head)
+        self.cross_attn = MultiHeadAttention(hidden_size, n_head)
+        self.layer_norm1 = LayerNorm(hidden_size)
+        self.layer_norm2 = LayerNorm(hidden_size)
+        self.layer_norm3 = LayerNorm(hidden_size)
+        self.feed_forward = nn.Sequential(
+            nn.Linear(hidden_size, ffn_size),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(ffn_size, hidden_size),
+        )
+
+    def forward(self, x, enc_h, self_mask=None, cross_mask=None):
+        # 自注意力
+        h1 = self.self_attn(x, mask=self_mask)
+        h1 = self.layer_norm1(x + h1)
+        # cross-attention
+        h2 = self.cross_attn(h1, mask=cross_mask, kv=enc_h)
+        h2 = self.layer_norm2(h1 + h2)
+        # 前馈
+        ffn_h = self.feed_forward(h2)
+        out = self.layer_norm3(h2 + ffn_h)
+        return out
+
+class Decoder(nn.Module):
+    def __init__(self, hidden_size, n_head, max_len, voc_size, ffn_size, dropout, n_layers, device):
+        super().__init__()
+        self.token_embeddings = TokenEmbedding(vocab_size=voc_size, embed_size=hidden_size)
+        self.decoder_layers = nn.ModuleList(
+            [DecoderLayer(hidden_size, n_head, ffn_size, dropout) for _ in range(n_layers)]
+        )
+
+    def forward(self, x, enc_h, self_mask=None, cross_mask=None):
+        h = self.token_embeddings(x)
+        for layer in self.decoder_layers:
+            h = layer(h, enc_h, self_mask, cross_mask)
+        return h
+
 class Transformer(nn.Module):
     def __init__(self, src_pad_idx, max_len, enc_voc_size, hidden_size, n_head, ffn_size, n_layers, drop_prop, device):
         super().__init__()
@@ -127,6 +168,15 @@ class Transformer(nn.Module):
                                n_head=n_head,
                                voc_size=enc_voc_size,
                                max_len=max_len,
+                               ffn_size=ffn_size,
+                               dropout=drop_prop,
+                               n_layers=n_layers,
+                               device=device
+                               )
+        self.decoder = Decoder(hidden_size=hidden_size,
+                               n_head=n_head,
+                               max_len=max_len,
+                               voc_size=enc_voc_size,
                                ffn_size=ffn_size,
                                dropout=drop_prop,
                                n_layers=n_layers,
