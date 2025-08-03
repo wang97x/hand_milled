@@ -52,21 +52,29 @@ class MultiHeadAttention(nn.Module):
 
         self.softmax = nn.Softmax(dim=-1)
 
-    def forward(self, x, mask=None):
+    def forward(self, x, mask=None, kv=None):
+        # x: [bsz, seq, hsz]，kv: [bsz, seq_kv, hsz] or None
         bsz, seq_len, dim = x.size()
-        q, k, v = self.w_q(x), self.w_k(x), self.w_v(x) # [bsz, seq, hsz]
+        if kv is None:
+            kv = x
+        k, v = self.w_k(kv), self.w_v(kv)
+        q = self.w_q(x)
 
         q = q.view(bsz, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
-        k = k.view(bsz, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
-        v = v.view(bsz, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        k = k.view(bsz, -1, self.num_heads, self.head_dim).transpose(1, 2)
+        v = v.view(bsz, -1, self.num_heads, self.head_dim).transpose(1, 2)
 
-        k = k.transpose(2, 3)
-        q_k = torch.matmul(q, k)/self.scale
+        k_t = k.transpose(2, 3)
+        q_k = torch.matmul(q, k_t) / self.scale
+
         if mask is not None:
-            mask = mask.unsqueeze(1).expand_as(q_k)
+            # mask: [bsz, seq_q, seq_kv] or [seq_q, seq_kv]
+            if mask.dim() == 2:
+                mask = mask.unsqueeze(0)
+            mask = mask.unsqueeze(1)  # [bsz, 1, seq_q, seq_kv]
             q_k = q_k.masked_fill(mask, -1e9)
 
-        scores = self.softmax(q_k) # [bsz, n_head, seq, seq]
+        scores = self.softmax(q_k)
         atten = torch.matmul(scores, v).transpose(1, 2).contiguous().view(bsz, seq_len, -1)
         return self.w_o(atten)
 
@@ -134,13 +142,10 @@ class DecoderLayer(nn.Module):
         )
 
     def forward(self, x, enc_h, self_mask=None, cross_mask=None):
-        # 自注意力
         h1 = self.self_attn(x, mask=self_mask)
         h1 = self.layer_norm1(x + h1)
-        # cross-attention
         h2 = self.cross_attn(h1, mask=cross_mask, kv=enc_h)
         h2 = self.layer_norm2(h1 + h2)
-        # 前馈
         ffn_h = self.feed_forward(h2)
         out = self.layer_norm3(h2 + ffn_h)
         return out
@@ -163,6 +168,7 @@ class Transformer(nn.Module):
     def __init__(self, src_pad_idx, max_len, enc_voc_size, hidden_size, n_head, ffn_size, n_layers, drop_prop, device):
         super().__init__()
         self.src_pad_idx = src_pad_idx
+        self.device = device
 
         self.encoder = Encoder(hidden_size=hidden_size,
                                n_head=n_head,
@@ -182,19 +188,25 @@ class Transformer(nn.Module):
                                n_layers=n_layers,
                                device=device
                                )
+        self.generator = nn.Linear(hidden_size, enc_voc_size)
 
-    def forward(self, src, trg) -> torch.Tensor:
-        src_pad_mask = self.src_pad_mask(src)
-        # trg_pad_mask = self.src_pad_mask(trg)
+    def forward(self, src, trg):
+        src_pad_mask = self.src_padding_mask(src)  # [bsz, src_len]
+        trg_pad_mask = self.src_padding_mask(trg)   # [bsz, trg_len]
+        trg_causal_mask = self.trg_causal_mask(trg)  # [trg_len, trg_len]
 
         enc_h = self.encoder(src, src_pad_mask)
-        # trg_out = self.decoder(trg, enc_h, trg_pad_mask)
-        # return trg_out
+        # 合并 pad mask 和 causal mask
+        # trg_pad_mask: [bsz, trg_len] -> [bsz, 1, trg_len]
+        # trg_causal_mask: [trg_len, trg_len] -> [1, trg_len, trg_len]
+        combined_mask = trg_pad_mask.unsqueeze(1) | trg_causal_mask.unsqueeze(0)
+        dec_out = self.decoder(trg, enc_h, self_mask=combined_mask, cross_mask=src_pad_mask.unsqueeze(1))
+        return self.generator(dec_out)
 
     def src_padding_mask(self, src):
-        return (src==self.src_pad_idx)
+        return (src == self.src_pad_idx)  # [bsz, seq_len], bool
 
     def trg_causal_mask(self, trg):
-        seq_len = trg.size(-1)
-        mask = torch.triu(torch.ones(seq_len, seq_len), diagonal=1)
-        return mask
+        seq_len = trg.size(1)
+        mask = torch.triu(torch.ones(seq_len, seq_len, device=trg.device), diagonal=1).bool()
+        return mask  # [seq_len, seq_len], bool
